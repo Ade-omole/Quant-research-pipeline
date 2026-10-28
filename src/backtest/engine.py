@@ -26,11 +26,22 @@ def positions_to_strategy_returns(
     return, not today's already-known return.
     """
 
+    # Every position column needs a matching return column; select them in order.
+    missing_columns = [column for column in positions.columns if column not in asset_returns.columns]
+    if missing_columns:
+        raise KeyError(f"asset_returns has no return column for positions: {missing_columns}")
+    asset_returns = asset_returns[list(positions.columns)]
     # Keep only dates that exist in both the position table and return table.
     aligned_positions, aligned_returns = positions.align(asset_returns, join="inner", axis=0)
     # Use yesterday's position to earn today's return.
     lagged_positions = aligned_positions.shift(1).fillna(0.0)  ## shift positions by one day; NaN -> 0
-    gross_returns = (lagged_positions * aligned_returns).sum(axis=1).rename("gross_return")  # weight at t-1 times return at t
+    # The panel is ragged: an asset has no return before it lists. Holding a position
+    # in an asset that does not trade yet would be a bug, so check it explicitly and
+    # only then treat the missing return as zero.
+    unlisted = aligned_returns.isna()
+    if bool((lagged_positions.abs() > 1e-12)[unlisted].any().any()):
+        raise ValueError("A position is held in an asset with no return on that date.")
+    gross_returns = (lagged_positions * aligned_returns.fillna(0.0)).sum(axis=1).rename("gross_return")  # weight at t-1 times return at t
     # Turnover measures how much the position changed through time.
     turnover = compute_turnover(aligned_positions)
     # Costs are proportional to turnover, transaction-cost assumptions, and slippage.

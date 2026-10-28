@@ -1,7 +1,20 @@
 """Portfolio construction helpers for combining stage-two strategies.
 
-At this layer, each strategy return stream is treated like an asset. The goal
-is to combine imperfect strategies into a more stable portfolio.
+At this layer, each strategy return stream is treated like an asset. The goal is to
+combine imperfect strategies into a more stable portfolio.
+
+Weighting methods
+-----------------
+* equal weight                    - the naive benchmark, 1/M each;
+* inverse volatility (Method A)   - risk-only, more weight to calmer strategies;
+* Markowitz max-Sharpe (Method B) - uses expected returns and covariances, with
+                                    optional shrinkage, weight caps and a
+                                    concentration penalty.
+
+``build_portfolio`` runs any of them through one shared execution pipeline
+(weights -> turnover cap -> portfolio-level costs -> volatility target), and
+``run_portfolio_grid`` evaluates every combination of a strategy *menu* and a
+weighting *method* so the contribution of any one strategy is visible.
 """
 
 from __future__ import annotations
@@ -47,6 +60,31 @@ def _estimate_covariance(
     return covariance + np.eye(n_strategies) * ridge_penalty
 
 
+# Human-readable names for the weighting methods, used in tables and figures.
+METHOD_LABELS: dict[str, str] = {
+    "equal_weight": "Equal weight",
+    "inverse_volatility": "Inverse vol",
+    "markowitz_baseline": "Markowitz",
+    "markowitz_shrinkage": "Markowitz + shrinkage",
+    "markowitz_cap70": "Markowitz cap 70%",
+    "markowitz_shrinkage_cap70": "Markowitz shrink + cap",
+    "markowitz_concentration": "Markowitz regularized",
+}
+
+
+def equal_weights(strategy_returns: pd.DataFrame) -> pd.DataFrame:
+    """Give every strategy the same weight, 1/M, on every date.
+
+    This is the benchmark any cleverer allocator has to beat; with noisy inputs it
+    is surprisingly hard to beat.
+    """
+
+    n_strategies = strategy_returns.shape[1]
+    return pd.DataFrame(
+        1.0 / n_strategies, index=strategy_returns.index, columns=strategy_returns.columns
+    )
+
+
 def inverse_volatility_weights(strategy_returns: pd.DataFrame, window: int = 63) -> pd.DataFrame:
     """Allocate more weight to strategies with lower trailing volatility.
 
@@ -74,8 +112,13 @@ def markowitz_max_sharpe_weights(
     use_ledoit_wolf: bool = False,
     max_weight: float = 1.0,
     concentration_lambda: float = 0.0,
+    rebalance_every: int = 1,
 ) -> pd.DataFrame:
-    """Rolling long-only max-Sharpe weights with optional shrinkage, caps, and concentration penalty."""
+    """Rolling long-only max-Sharpe weights with optional shrinkage, caps, and concentration penalty.
+
+    ``rebalance_every=1`` re-optimizes daily (the original behaviour); a larger value
+    re-optimizes less often and holds the weights in between.
+    """
 
     if not 0.0 < max_weight <= 1.0:
         raise ValueError("max_weight must be in (0, 1].")
@@ -89,7 +132,7 @@ def markowitz_max_sharpe_weights(
     bounds = [(0.0, max_weight) for _ in strategy_names]
     constraints = {"type": "eq", "fun": lambda weights: np.sum(weights) - 1.0}
 
-    for end_position in range(window, len(strategy_returns) + 1):
+    for end_position in range(window, len(strategy_returns) + 1, rebalance_every):
         window_returns = strategy_returns.iloc[end_position - window : end_position]
         expected_returns = window_returns.mean().values * annualization_factor
         covariance = _estimate_covariance(
@@ -126,7 +169,11 @@ def markowitz_max_sharpe_weights(
             pd.Series(weights, index=strategy_names, name=strategy_returns.index[end_position - 1])
         )
 
-    return pd.DataFrame(optimized_weights)
+    weights_frame = pd.DataFrame(optimized_weights)
+    if rebalance_every > 1:
+        # Hold each solution until the next re-optimization.
+        weights_frame = weights_frame.reindex(strategy_returns.index[window - 1 :]).ffill()
+    return weights_frame
 
 
 def markowitz_variant_weights(
@@ -245,3 +292,102 @@ def markowitz_avg_weights_table(variant_results: dict[str, dict]) -> pd.DataFram
             for name, res in variant_results.items()
         }
     ).round(1)
+
+
+def portfolio_weights(
+    strategy_returns: pd.DataFrame,
+    method: str,
+    *,
+    rebalance_every: int = 1,
+) -> pd.DataFrame:
+    """Dispatch to a weighting method by name."""
+
+    if method == "equal_weight":
+        return equal_weights(strategy_returns)
+    if method == "inverse_volatility":
+        return inverse_volatility_weights(strategy_returns)
+    if method in MARKOWITZ_VARIANTS:
+        return markowitz_variant_weights(strategy_returns, method, rebalance_every=rebalance_every)
+    valid = ", ".join(["equal_weight", "inverse_volatility", *MARKOWITZ_VARIANTS])
+    raise ValueError(f"Unknown weighting method {method!r}. Choose from: {valid}")
+
+
+def build_portfolio(
+    strategy_returns: pd.DataFrame,
+    method: str,
+    *,
+    turnover_cap: float | None = None,
+    transaction_cost_bps: float | None = None,
+    slippage_bps: float | None = None,
+    target_volatility: float | None = None,
+    rebalance_every: int = 1,
+) -> dict[str, object]:
+    """The whole execution pipeline: weights -> turnover cap -> costs -> vol target.
+
+    Returns the raw and capped weights, the cost backtest frame, and ``returns``,
+    the final after-cost, volatility-targeted return series.
+    """
+
+    turnover_cap = COST_CONFIG.turnover_cap if turnover_cap is None else turnover_cap
+    transaction_cost_bps = (
+        COST_CONFIG.transaction_cost_bps if transaction_cost_bps is None else transaction_cost_bps
+    )
+    slippage_bps = COST_CONFIG.slippage_bps if slippage_bps is None else slippage_bps
+    target_volatility = (
+        COST_CONFIG.target_portfolio_vol if target_volatility is None else target_volatility
+    )
+
+    weights = portfolio_weights(strategy_returns, method, rebalance_every=rebalance_every)
+    weights_capped = apply_turnover_cap(weights, turnover_cap) if turnover_cap is not None else weights
+    backtest = positions_to_strategy_returns(
+        weights_capped, strategy_returns, transaction_cost_bps, slippage_bps
+    )
+    returns = apply_volatility_target(backtest["net_return"], target_volatility)
+    return {
+        "weights": weights,
+        "weights_capped": weights_capped,
+        "backtest": backtest,
+        "returns": returns,
+    }
+
+
+def run_portfolio_grid(
+    strategy_returns: pd.DataFrame,
+    menus: dict[str, tuple[str, ...]],
+    methods: tuple[str, ...],
+    **pipeline_kwargs,
+) -> tuple[pd.DataFrame, dict[str, pd.Series], dict[str, dict[str, object]]]:
+    """Build every (menu x method) portfolio and tabulate its metrics.
+
+    A *menu* is a subset of the strategies. Comparing menus that differ by one
+    strategy is how the contribution of that strategy is measured.
+    """
+
+    rows: dict[str, dict[str, object]] = {}
+    returns_by_name: dict[str, pd.Series] = {}
+    results_by_name: dict[str, dict[str, object]] = {}
+    for menu_name, strategy_names in menus.items():
+        available = [name for name in strategy_names if name in strategy_returns.columns]
+        if len(available) < 2:
+            continue
+        menu_returns = strategy_returns[available].dropna(how="any")
+        for method in methods:
+            result = build_portfolio(menu_returns, method, **pipeline_kwargs)
+            final_returns = result["returns"].dropna()
+            metrics = performance_metrics(final_returns)
+            metrics["menu"] = menu_name
+            metrics["method"] = method
+            metrics["n_strategies"] = len(available)
+            metrics["ann_turnover"] = float(result["backtest"]["turnover"].mean() * 252)
+            metrics["start"] = str(final_returns.index.min().date())
+            name = f"{menu_name}_{method}"
+            rows[name] = metrics
+            returns_by_name[name] = final_returns
+            results_by_name[name] = result
+    return pd.DataFrame(rows).T, returns_by_name, results_by_name
+
+
+def strategy_correlation(strategy_returns: pd.DataFrame) -> pd.DataFrame:
+    """Correlation matrix of the strategy return streams (the case for diversification)."""
+
+    return strategy_returns.dropna(how="any").corr()

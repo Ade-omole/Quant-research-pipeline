@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 
@@ -12,30 +13,30 @@ def pairs_positions_from_zscore(
     entry_threshold: float = 1.5,
     exit_threshold: float = 0.5,
 ) -> pd.DataFrame:
-    """Go long the spread when it is cheap and short it when it is rich."""
+    """Go long the spread when it is cheap and short it when it is rich.
 
-    # Start with zero exposure on every date for both assets.
-    positions = pd.DataFrame(0.0, index=zscore.index, columns=[asset_a, asset_b])
-    # Track the current signal so the strategy can hold a trade until exit.
-    current_signal = 0.0
+    The rule has three triggers and one hold state:
 
-    # Iterate through valid z-score observations in chronological order.
-    for timestamp, value in zscore.dropna().items():
-        # A high z-score means asset_a is expensive relative to asset_b.
-        # Short the spread: short asset_a and long asset_b.
-        if value > entry_threshold:
-            current_signal = -1.0
-        # A low z-score means asset_a is cheap relative to asset_b.
-        # Long the spread: long asset_a and short asset_b.
-        elif value < -entry_threshold:
-            current_signal = 1.0
-        # Once the spread comes close to normal, close the trade.
-        elif abs(value) < exit_threshold:
-            current_signal = 0.0
+    * ``z > entry``  -> asset_a is expensive relative to asset_b, so short the spread;
+    * ``z < -entry`` -> asset_a is cheap, so go long the spread;
+    * ``|z| < exit`` -> the spread is back near its mean, so close the trade;
+    * anything else  -> keep whatever position is already open.
 
-        # The first asset receives the signal direction.
-        positions.loc[timestamp, asset_a] = current_signal
-        # The second asset receives the opposite direction to form a pair trade.
-        positions.loc[timestamp, asset_b] = -current_signal # or -current_signal * hedge_ratio (better)
+    Because the "hold" state simply carries the last decision forward, the whole rule is
+    a forward fill of the three trigger states. Writing it that way instead of looping
+    over dates gives identical positions and is dramatically faster, which matters when
+    the walk-forward re-runs the rule once per fold.
+    """
 
-    return positions
+    # Mark only the dates where a trigger fires; leave the hold dates missing.
+    signal = pd.Series(np.nan, index=zscore.index, dtype=float)
+    signal[zscore > entry_threshold] = -1.0
+    signal[zscore < -entry_threshold] = 1.0
+    signal[zscore.abs() < exit_threshold] = 0.0
+    # A missing z-score cannot trigger anything, so it must also be a hold.
+    signal[zscore.isna()] = np.nan
+    # Carry each decision forward until the next trigger; start flat.
+    signal = signal.ffill().fillna(0.0)
+
+    # The second leg takes the opposite side to form the pair trade.
+    return pd.DataFrame({asset_a: signal, asset_b: -signal}, index=zscore.index)

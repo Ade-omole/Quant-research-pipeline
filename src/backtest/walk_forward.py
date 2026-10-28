@@ -5,6 +5,13 @@ following test slice, then concatenates disjoint out-of-sample test segments int
 one position path. Regime switching uses train-period returns only when mapping
 anonymous HMM states to bull/sideways/crisis labels.
 
+Adaptive asset allocation has no model to refit: its weights are a deterministic
+function of trailing prices. For it the walk-forward instead *selects parameters*.
+On every fold each candidate parameter set is scored by its net Sharpe on the
+training window only, and the winner's positions are used on the following test
+block. That answers the question "what would this rule have earned if I had not
+known the right lookback in advance?".
+
 Walk-forward modules return **positions only**. The notebook (or any caller) should
 feed those positions through ``positions_to_strategy_returns`` with your
 ``transaction_cost_bps`` and ``slippage_bps`` so net PnL matches the friction model.
@@ -12,22 +19,32 @@ feed those positions through ``positions_to_strategy_returns`` with your
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import numpy as np
 import pandas as pd
 
+from src.backtest.engine import positions_to_strategy_returns
 from src.models.ou import compute_spread_zscore
 from src.models.regime import fit_hmm_regime_model, infer_regimes
 from src.models.volatility import fit_random_forest_volatility_model, predict_random_forest_volatility
 from src.strategies.pairs_trading import pairs_positions_from_zscore
 from src.strategies.regime_switching import build_regime_label_map, regime_based_positions
+from src.strategies import adaptive_allocation
 from src.strategies.volatility_timing import inverse_volatility_position
+from src.utils.config import (
+    AAA_CONFIG, DATA_CONFIG, PAIRS_CONFIG, WALK_FORWARD_CONFIG, PairsConfig, WalkForwardConfig,
+)
 from src.utils.data_loader import estimate_pair_ols_coefficients, spread_from_prices
 
 
 def infer_walk_forward_calendar(
     volatility_features: pd.DataFrame,
     regime_features: pd.DataFrame,
-    prices_a: pd.Series,
-    prices_b: pd.Series,
+    prices_a: pd.Series | None = None,
+    prices_b: pd.Series | None = None,
+    *,
+    extra_indexes: list[pd.Index] | None = None,
 ) -> pd.DatetimeIndex:
     """Trading dates where volatility features, regime features, and pair prices are all valid.
 
@@ -39,10 +56,21 @@ def infer_walk_forward_calendar(
 
     vol_ok = volatility_features.dropna(how="any").index
     reg_ok = regime_features.dropna(how="any").index
-    pair_ok = pd.concat([prices_a, prices_b], axis=1).dropna(how="any").index
-    # Shared calendar keeps all three walk-forward paths on the same train/test dates.
-    common = vol_ok.intersection(reg_ok).intersection(pair_ok).sort_values()
-    return pd.DatetimeIndex(common)
+    # The pair legs are optional. Since the pairs sleeve now scans every pair rather
+    # than trading one configured pair, the shared calendar should not be narrowed by
+    # whichever pair happened to be the default; each pair contributes zero positions
+    # on dates where one of its own legs has not listed.
+    if prices_a is not None and prices_b is not None:
+        pair_ok = pd.concat([prices_a, prices_b], axis=1).dropna(how="any").index
+    else:
+        pair_ok = vol_ok
+    # Shared calendar keeps every walk-forward path on the same train/test dates.
+    common = vol_ok.intersection(reg_ok).intersection(pair_ok)
+    # Rule-based strategies (adaptive allocation) contribute the dates on which their
+    # signal exists, so they share the folds rather than defining their own.
+    for extra in extra_indexes or []:
+        common = common.intersection(pd.Index(extra))
+    return pd.DatetimeIndex(common.sort_values())
 
 
 def expanding_walk_forward_splits(
@@ -216,3 +244,159 @@ def walk_forward_pairs_positions(
     out = pd.concat(position_chunks).sort_index()
     out = out[~out.index.duplicated(keep="first")]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward parameter selection for the rule-based strategy
+# ---------------------------------------------------------------------------
+
+
+def training_sharpe(
+    returns: pd.Series,
+    annualization_factor: int = 252,
+    min_observations: int = 63,
+) -> float:
+    """Annualized Sharpe used to score candidate parameter sets on a training window."""
+
+    clean = returns.dropna()
+    if len(clean) < min_observations or clean.std() == 0:
+        return float("-inf")
+    return float(np.sqrt(annualization_factor) * clean.mean() / clean.std())
+
+
+def adaptive_allocation_candidates(
+    prices: pd.DataFrame,
+    cfg: WalkForwardConfig = WALK_FORWARD_CONFIG,
+) -> dict[str, pd.DataFrame]:
+    """Position tables for every (lookback, top_n) pair in the walk-forward grid.
+
+    The rule is causal: the weight on day t depends only on prices up to day t, so a
+    table built on the full history is identical, row by row, to one built on any
+    history truncated at t. Building the candidates once is therefore both correct
+    and fast; the walk-forward then only decides which candidate is live.
+    ``tests/test_walk_forward_integrity.py`` verifies this property directly.
+    """
+
+    return {
+        f"lb{lookback}_top{top_n}": adaptive_allocation.build_positions(
+            prices, replace(AAA_CONFIG, lookback=lookback, top_n=top_n)
+        )
+        for lookback in cfg.aaa_lookbacks
+        for top_n in cfg.aaa_top_n
+    }
+
+
+def walk_forward_rule_positions(
+    candidate_positions: dict[str, pd.DataFrame],
+    asset_returns: pd.DataFrame,
+    *,
+    calendar: pd.DatetimeIndex | pd.Index,
+    min_train_observations: int | None = None,
+    test_observations: int | None = None,
+    transaction_cost_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Expanding-window parameter selection by training-window net Sharpe.
+
+    Returns the stitched out-of-sample positions and a Series recording which
+    candidate was chosen at the start of each test block.
+    """
+
+    idx = pd.DatetimeIndex(pd.Index(calendar).drop_duplicates().sort_values())
+    if min_train_observations is None:
+        min_train_observations = WALK_FORWARD_CONFIG.min_train_observations
+    if test_observations is None:
+        test_observations = WALK_FORWARD_CONFIG.test_observations
+
+    splits = expanding_walk_forward_splits(idx, min_train_observations, test_observations)
+    all_columns = sorted({column for positions in candidate_positions.values() for column in positions.columns})
+    if not splits:
+        return pd.DataFrame(columns=all_columns), pd.Series(dtype=object)
+
+    # Net return of every candidate over the whole history. Each candidate pays its
+    # own turnover cost, so a parameter set that trades more is penalised for it.
+    candidate_net = {
+        label: positions_to_strategy_returns(
+            positions, asset_returns, transaction_cost_bps, slippage_bps
+        )["net_return"]
+        for label, positions in candidate_positions.items()
+    }
+
+    chunks: list[pd.DataFrame] = []
+    choices: dict[pd.Timestamp, str] = {}
+    for train_index, test_index in splits:
+        # Score every candidate on the training window only.
+        scores = {label: training_sharpe(net.reindex(train_index)) for label, net in candidate_net.items()}
+        best_label = max(scores, key=scores.get)
+        # Trade the winner on the following test block only.
+        chunk = candidate_positions[best_label].reindex(index=test_index, columns=all_columns).fillna(0.0)
+        chunks.append(chunk)
+        choices[test_index[0]] = best_label
+
+    stitched = pd.concat(chunks).sort_index()
+    stitched = stitched[~stitched.index.duplicated(keep="first")]
+    return stitched, pd.Series(choices, name="selected_parameters")
+
+
+def pair_candidates(
+    prices: pd.DataFrame,
+    calendar: pd.DatetimeIndex | pd.Index,
+    *,
+    cfg: PairsConfig = PAIRS_CONFIG,
+    min_train_observations: int | None = None,
+    test_observations: int | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Walk-forward position tables for every eligible pair.
+
+    Each pair's hedge ratio is refit on the training prefix of every fold, exactly as
+    ``walk_forward_pairs_positions`` already does, so these tables are themselves
+    out of sample. Selecting among them on training performance therefore adds a
+    second, outer layer of walk-forward rather than reintroducing hindsight.
+    """
+
+    import itertools
+
+    pairs = cfg.candidate_pairs or list(itertools.combinations(sorted(DATA_CONFIG.symbols), 2))
+    return {
+        f"{asset_a}-{asset_b}": walk_forward_pairs_positions(
+            prices[asset_a], prices[asset_b], asset_a, asset_b,
+            calendar=calendar, zscore_window=cfg.zscore_window,
+            min_train_observations=min_train_observations,
+            test_observations=test_observations,
+        )
+        for asset_a, asset_b in pairs
+    }
+
+
+def walk_forward_pair_selection(
+    prices: pd.DataFrame,
+    asset_returns: pd.DataFrame,
+    *,
+    calendar: pd.DatetimeIndex | pd.Index,
+    cfg: PairsConfig = PAIRS_CONFIG,
+    min_train_observations: int | None = None,
+    test_observations: int | None = None,
+    transaction_cost_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Choose which pair to trade on each fold, using training data only.
+
+    Hard-coding one pair is a hindsight decision: the pair that looks best over the
+    whole sample was chosen knowing the whole sample. Here the eligible pairs are
+    scored by net Sharpe ratio on each expanding training window, and the winner is
+    traded on the following test block. Returns the stitched positions and a record
+    of which pair was live when.
+    """
+
+    candidates = pair_candidates(
+        prices, calendar, cfg=cfg,
+        min_train_observations=min_train_observations,
+        test_observations=test_observations,
+    )
+    return walk_forward_rule_positions(
+        candidates, asset_returns, calendar=calendar,
+        min_train_observations=min_train_observations,
+        test_observations=test_observations,
+        transaction_cost_bps=transaction_cost_bps,
+        slippage_bps=slippage_bps,
+    )

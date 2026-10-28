@@ -8,14 +8,26 @@ from statsmodels.tsa.stattools import coint
 
 
 def run_cointegration_test(series_a: pd.Series, series_b: pd.Series) -> dict[str, float]:
-    """Engle-Granger cointegration test on aligned price levels."""
+    """Engle-Granger cointegration test on aligned price levels.
 
-    aligned_a, aligned_b = series_a.align(series_b, join="inner")
-    test_statistic, p_value, critical_values = coint(aligned_a, aligned_b)
+    The panel is ragged: two ETFs may not have listed at the same time, so aligning
+    on the index alone can leave missing values that the test cannot accept. Only the
+    dates on which *both* series trade are used, and the number of those dates is
+    returned so the caller can see how much history the test actually had.
+    """
+
+    aligned = pd.concat([series_a, series_b], axis=1, keys=["a", "b"]).dropna(how="any")
+    if len(aligned) < 30:
+        nan = float("nan")
+        return {"test_statistic": nan, "p_value": nan, "critical_value_5pct": nan,
+                "overlapping_observations": float(len(aligned))}
+
+    test_statistic, p_value, critical_values = coint(aligned["a"], aligned["b"])
     return {
         "test_statistic": float(test_statistic),
         "p_value": float(p_value),
         "critical_value_5pct": float(critical_values[1]),
+        "overlapping_observations": float(len(aligned)),
     }
 
 

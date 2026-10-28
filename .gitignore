@@ -32,3 +32,25 @@ Thumbs.db
 
 # LaTeX (repo root only; docs/ is ignored above)
 texput.log
+
+# ---- Kept locally, not published to GitHub ----
+# Walk-forward integrity tests
+tests/
+
+# Generated pipeline outputs (recreate with `python run_research.py`)
+results/
+
+# Research summary: publish only the two PDFs, not the LaTeX sources,
+# generated tables/figures, build files or backups
+research_summary/*
+!research_summary/.gitkeep
+!research_summary/full_QR_summary.pdf
+!research_summary/QR_short_summary.pdf
+
+# LaTeX build files and temp files anywhere
+*.aux
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+*.tmp
